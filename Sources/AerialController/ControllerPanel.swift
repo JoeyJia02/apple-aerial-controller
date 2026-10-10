@@ -17,7 +17,7 @@ struct ControllerPanel: View {
                         Text("Apple 原生航拍 · 单屏").font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Text(model.isAutomatic ? "运行中" : "已暂停")
+                    Text(model.isAutomatic ? "轮换中" : "轮换暂停")
                         .font(.caption.weight(.medium))
                         .padding(.horizontal, 8).padding(.vertical, 4)
                         .background(model.isAutomatic ? Color.green.opacity(0.12) : Color.secondary.opacity(0.1), in: Capsule())
@@ -33,22 +33,47 @@ struct ControllerPanel: View {
                     if model.isLoading || model.isSwitching { ProgressView().controlSize(.small) }
                 }
 
-                HStack(spacing: 10) {
+                Button {
+                    if !model.isAutomatic { onDesktopPlaybackRequested() }
+                    model.toggleAutomatic()
+                } label: {
+                    Label(model.isAutomatic ? "暂停轮换" : "开始轮换",
+                          systemImage: model.isAutomatic ? "pause.fill" : "play.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!model.isAutomatic && !model.canSwitch || model.isSwitching)
+
+                HStack(spacing: 8) {
                     Button {
-                        if !model.isAutomatic { onDesktopPlaybackRequested() }
-                        model.toggleAutomatic()
+                        onDesktopPlaybackRequested()
+                        Task { await model.previous() }
                     } label: {
-                        Label(model.isAutomatic ? "暂停轮换" : "开始轮换",
-                              systemImage: model.isAutomatic ? "pause.fill" : "play.fill")
+                        Label("上一张", systemImage: "backward.end.fill")
                             .frame(maxWidth: .infinity)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!model.isAutomatic && !model.canSwitch || model.isSwitching)
+                    .disabled(!model.canPrevious)
+                    .help("按本次运行的切换历史回退，并从头完整播放")
+                    Button {
+                        if model.isPlaybackPaused {
+                            onDesktopPlaybackRequested()
+                            Task { await model.resumePlayback() }
+                        } else {
+                            model.pausePlayback()
+                        }
+                    } label: {
+                        Label(model.isPlaybackPaused ? "继续播放" : "暂停播放",
+                              systemImage: model.isPlaybackPaused ? "play.fill" : "pause.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .disabled(!model.canPausePlayback && !model.canResumePlayback)
+                    .help("暂停保留当前画面；继续从原进度播放，不重头开始")
                     Button {
                         onDesktopPlaybackRequested()
                         Task { await model.next() }
                     } label: {
                         Label("下一张", systemImage: "forward.end.fill")
+                            .frame(maxWidth: .infinity)
                     }
                     .disabled(!model.canSwitch)
                     .help("随机切换下一张，完整播放后停在最后一帧")
@@ -59,13 +84,19 @@ struct ControllerPanel: View {
                         onDesktopPlaybackRequested()
                         Task { await model.replay() }
                     } label: {
-                        Label(model.isReplaying ? "播放中…" : "重新播放", systemImage: "arrow.counterclockwise")
+                        Label(model.isReplaying && !model.isPlaybackPaused ? "播放中…" : "重新播放", systemImage: "arrow.counterclockwise")
                     }
                     .disabled(!model.canReplay)
                     .help("从头完整播放当前航拍，结束后停在最后一帧")
                     if model.hasReplayFrame || model.isReplaying {
                         Button("返回原生画面") { model.stopReplay() }
                     }
+                }
+
+                if model.isPlaybackPaused {
+                    Text("播放暂停期间跳过自动切换；可继续播放，或手动切换上一张／下一张。")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 GroupBox {

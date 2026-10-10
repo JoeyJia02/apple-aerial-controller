@@ -12,6 +12,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var isSwitching = false
     @Published private(set) var isReplaying = false
+    @Published private(set) var isPlaybackPaused = false
     @Published private(set) var hasReplayFrame = false
     @Published private(set) var isAutomatic = false
     @Published private(set) var environmentReady = false
@@ -22,6 +23,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var message = "初次打开为暂停状态。"
     @Published private(set) var errorMessage: String?
     @Published private(set) var nextDue: Date?
+    @Published private var previousAssetIDs: [String] = []
 
     let scheduler = RotationScheduler()
     let switcher: NativeAerialSwitcher
@@ -74,6 +76,23 @@ final class AppModel: ObservableObject {
     var playlist: [AerialAsset] { catalog?.playlist(categories: selectedCategories) ?? [] }
     var currentAsset: AerialAsset? { catalog?.assets.first { $0.assetID == currentAssetID } }
     var canSwitch: Bool { !isTerminating && environmentReady && !isLoading && !isSwitching && !playlist.isEmpty }
+    var canPrevious: Bool {
+        !isTerminating && environmentReady && !isLoading && !isSwitching && previousTarget != nil
+    }
+    var canPausePlayback: Bool { !isTerminating && !isLoading && !isSwitching && desktopReplay.state == .playing }
+    var canResumePlayback: Bool {
+        !isTerminating && environmentReady && !isLoading && !isSwitching && desktopReplay.state == .paused
+    }
+    private var previousTarget: (asset: AerialAsset, index: Int)? {
+        for (index, id) in previousAssetIDs.enumerated().reversed() {
+            if id != currentAssetID, let asset = catalog?.assets.first(where: { $0.assetID == id }),
+               asset.downloaded, asset.eligibleForNativeSwitch,
+               asset.categories.contains(where: \.isPrimaryCategory), asset.localVideoURL != nil {
+                return (asset, index)
+            }
+        }
+        return nil
+    }
     var canReplay: Bool {
         guard !isTerminating, environmentReady, !isLoading, !isSwitching, !isReplaying,
               let asset = currentAsset, nativeSelectionID == asset.assetID else { return false }
@@ -88,25 +107,36 @@ final class AppModel: ObservableObject {
             if isReplaying || hasReplayFrame { message = "已回到系统壁纸画面。" }
             replayGeneration &+= 1
             isReplaying = false
+            isPlaybackPaused = false
             hasReplayFrame = false
         case .preparing:
             isReplaying = true
+            isPlaybackPaused = false
             // Keep the previous visible frame while the replacement decodes.
             message = "正在准备播放当前航拍…"
         case .prepared:
             isReplaying = true
+            isPlaybackPaused = false
             hasReplayFrame = true
             message = "首帧已准备，即将播放…"
         case .playing:
             isReplaying = true
+            isPlaybackPaused = false
             hasReplayFrame = true
             message = "正在播放当前航拍；完整播放后停在最后一帧。"
+        case .paused:
+            isReplaying = true
+            isPlaybackPaused = true
+            hasReplayFrame = true
+            message = "播放已暂停；继续播放将从当前位置开始。"
         case .holding:
             isReplaying = false
+            isPlaybackPaused = false
             hasReplayFrame = true
             message = "已完整播放，停在最后一帧。"
         case .failed(let reason):
             isReplaying = false
+            isPlaybackPaused = false
             hasReplayFrame = false
             errorMessage = reason
             message = "桌面播放未完成，已返回系统壁纸。"
@@ -116,6 +146,7 @@ final class AppModel: ObservableObject {
     func stopReplay(updateMessage: Bool = true) {
         replayGeneration &+= 1
         isReplaying = false
+        isPlaybackPaused = false
         hasReplayFrame = false
         desktopReplay.stop()
         if updateMessage { message = "已回到系统壁纸画面。" }
@@ -131,6 +162,51 @@ final class AppModel: ObservableObject {
         errorMessage = nil
         defer { isSwitching = false }
         await playCurrentAerial(assetID: assetID, generation: generation, afterSwitch: false)
+    }
+
+    func pausePlayback() {
+        guard canPausePlayback else { return }
+        do {
+            try desktopReplay.pausePlayback()
+            automaticGeneration &+= 1
+            errorMessage = nil
+        } catch {
+            stopReplay(updateMessage: false)
+            errorMessage = error.localizedDescription
+            message = "播放控制未完成，已返回系统壁纸。"
+        }
+    }
+
+    func resumePlayback() async {
+        guard canResumePlayback, let assetID = currentAssetID else { return }
+        let generation = replayGeneration
+        automaticGeneration &+= 1
+        isSwitching = true
+        errorMessage = nil
+        defer { isSwitching = false }
+        do {
+            let url = try await switcher.validatedReplaySource(expectedAssetID: assetID)
+            guard !isTerminating, generation == replayGeneration, currentAssetID == assetID else { throw CancellationError() }
+            try desktopReplay.validateActiveSource(url: url)
+            if desktopReplay.state == .paused { try desktopReplay.resumePlayback() }
+            if isAutomatic { scheduler.resetCountdown() }
+        } catch is CancellationError {
+            if generation == replayGeneration { stopReplay(updateMessage: true) }
+        } catch {
+            guard !isTerminating, generation == replayGeneration else { return }
+            let mediaFailure: String?
+            if case .failed(let reason) = desktopReplay.state { mediaFailure = reason }
+            else { mediaFailure = nil }
+            stopReplay(updateMessage: false)
+            if error is NativeAerialSwitcherError {
+                pause()
+                applyDiagnostics(await switcher.diagnostics())
+                errorMessage = readableError(error)
+            } else {
+                errorMessage = mediaFailure ?? error.localizedDescription
+            }
+            message = "继续播放未完成，已返回系统壁纸。"
+        }
     }
 
     /// Replay starts a video; Next only verifies its already-running video after
@@ -344,6 +420,17 @@ final class AppModel: ObservableObject {
             if isAutomatic { scheduler.resetCountdown() }
             return
         }
+        await switchTo(asset: asset, previousIndex: nil)
+    }
+
+    func previous() async {
+        guard canPrevious, let target = previousTarget else { return }
+        automaticGeneration &+= 1
+        await switchTo(asset: target.asset, previousIndex: target.index)
+    }
+
+    private func switchTo(asset: AerialAsset, previousIndex: Int?) async {
+        let priorAssetID = currentAssetID
         // Start the target as soon as its frame is ready. Native synchronization
         // follows behind the moving desktop surface, without a first-frame hold.
         replayGeneration &+= 1
@@ -379,6 +466,14 @@ final class AppModel: ObservableObject {
             nativeSelectionID = asset.assetID
             currentName = asset.localizedName
             canRestore = await switcher.canRestore
+            // History records successful native choices, including when the
+            // desktop preview was cancelled during the native await.
+            if let previousIndex {
+                previousAssetIDs.removeSubrange(previousIndex..<previousAssetIDs.count)
+            } else if let priorAssetID, priorAssetID != asset.assetID {
+                previousAssetIDs.append(priorAssetID)
+                if previousAssetIDs.count > 100 { previousAssetIDs.removeFirst(previousAssetIDs.count - 100) }
+            }
         } catch {
             guard !isTerminating else { return }
             stopReplay(updateMessage: false)
@@ -406,6 +501,7 @@ final class AppModel: ObservableObject {
         do {
             let result = try await switcher.restore()
             guard result.selectionRestored else { throw ControllerError.restoreNotVerified }
+            previousAssetIDs.removeAll()
             applyDiagnostics(await switcher.diagnostics())
             message = result.nativeProviderVerified ? "已恢复接管前设置，自动轮换保持暂停。" : "原设置已恢复；原生资源加载尚未确认。"
         } catch {
@@ -423,6 +519,7 @@ final class AppModel: ObservableObject {
         defer { isLoading = false }
         do {
             let diagnostic = try await switcher.adoptCurrentSettings()
+            previousAssetIDs.removeAll()
             applyDiagnostics(diagnostic)
             environmentReady = diagnostic.isPrepared && !diagnostic.externalChangeDetected
             errorMessage = nil
@@ -434,7 +531,10 @@ final class AppModel: ObservableObject {
         nativeSelectionID = diagnostic.currentAssetID
         canRestore = diagnostic.canRestore
         externalChangeDetected = diagnostic.externalChangeDetected
-        if diagnostic.externalChangeDetected { environmentReady = false }
+        if diagnostic.externalChangeDetected {
+            environmentReady = false
+            previousAssetIDs.removeAll()
+        }
         let fixedID = diagnostic.currentAssetID.flatMap { value in catalog?.assets.contains { $0.assetID == value } == true ? value : nil }
         let id = fixedID ?? diagnostic.nativeMovieIDs.first ?? diagnostic.currentAssetID
         currentAssetID = id

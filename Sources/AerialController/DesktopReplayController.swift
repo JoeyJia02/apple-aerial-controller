@@ -7,7 +7,7 @@ import CoreGraphics
 @MainActor
 final class DesktopReplayController {
     enum State: Equatable, Sendable {
-        case idle, preparing, prepared, playing, holding
+        case idle, preparing, prepared, playing, paused, holding
         case failed(String)
 
         var name: String {
@@ -16,6 +16,7 @@ final class DesktopReplayController {
             case .preparing: "preparing"
             case .prepared: "prepared"
             case .playing: "playing"
+            case .paused: "paused"
             case .holding: "holding"
             case .failed: "failed"
             }
@@ -48,7 +49,11 @@ final class DesktopReplayController {
         case seekFailed
         case prerollFailed
         case notPrepared
+        case notPlaying
+        case notPaused
+        case playbackAlreadyEnded
         case preparedSourceMismatch
+        case preservedFailure(String)
         case mediaFailed(String)
         case playbackStalled
 
@@ -61,7 +66,11 @@ final class DesktopReplayController {
             case .seekFailed: "无法从航拍视频开头重新播放。"
             case .prerollFailed: "航拍视频播放准备失败。"
             case .notPrepared: "航拍视频尚未准备好，或播放准备已取消。"
+            case .notPlaying: "当前没有正在播放的航拍视频。"
+            case .notPaused: "当前没有可以继续播放的已暂停航拍。"
+            case .playbackAlreadyEnded: "当前航拍已完整播放，请使用重新播放。"
             case .preparedSourceMismatch: "待播放视频与已准备的视频不一致。"
+            case .preservedFailure(let message): message
             case .mediaFailed(let message): "航拍视频播放失败：\(message)"
             case .playbackStalled: "航拍视频连续 30 秒没有播放进展，已恢复系统桌面。"
             }
@@ -249,8 +258,63 @@ final class DesktopReplayController {
     /// have ended; validating it must never seek, restart, or pause playback.
     func validateActiveSource(url: URL) throws {
         try Task.checkCancellation()
-        guard state == .playing || state == .holding,
-              let session = visibleSession, isCurrent(session),
+        try throwIfFailed()
+        guard state == .playing || state == .paused || state == .holding else {
+            throw ReplayError.notPrepared
+        }
+        let session = try validatedVisibleSession()
+        guard url.isFileURL, canonicalURL(url) == session.url else {
+            throw ReplayError.preparedSourceMismatch
+        }
+        if state == .holding, !session.completedToEnd { throw ReplayError.notPrepared }
+    }
+
+    /// Holds the current decoded frame without replacing the player or seeking.
+    /// A natural end that races this request settles into holding, not paused.
+    func pausePlayback() throws {
+        try Task.checkCancellation()
+        try throwIfFailed()
+        guard state != .holding else { throw ReplayError.playbackAlreadyEnded }
+        guard state == .playing else { throw ReplayError.notPlaying }
+        let session = try validatedVisibleSession()
+        session.player.pause()
+        playbackMonitor?.cancel()
+        playbackMonitor = nil
+        if session.completedToEnd || hasReachedNaturalEnd(session) {
+            holdLastFrame(session: session)
+            return
+        }
+        publish(.paused)
+        try ensureCurrent(session.token)
+    }
+
+    /// Continues the same player at its existing media time. A stopped, failed,
+    /// or naturally completed session cannot be resumed through this method.
+    func resumePlayback() throws {
+        try Task.checkCancellation()
+        try throwIfFailed()
+        guard state != .holding else { throw ReplayError.playbackAlreadyEnded }
+        guard state == .paused else { throw ReplayError.notPaused }
+        let session = try validatedVisibleSession()
+        if session.completedToEnd || hasReachedNaturalEnd(session) {
+            holdLastFrame(session: session)
+            return
+        }
+        session.lastProgressAt = ContinuousClock.now
+        let seconds = CMTimeGetSeconds(session.player.currentTime())
+        session.lastObservedMediaSeconds = seconds.isFinite ? seconds : nil
+        session.player.play()
+        publish(.playing)
+        try ensureCurrent(session.token)
+        installPlaybackMonitor(session: session)
+    }
+
+    private func throwIfFailed() throws {
+        if case .failed(let message) = state { throw ReplayError.preservedFailure(message) }
+    }
+
+    private func validatedVisibleSession() throws -> DesktopReplaySession {
+        guard let session = visibleSession, isCurrent(session),
               let window, window.isVisible,
               let hostLayer = window.contentView?.layer,
               session.layer.superlayer === hostLayer,
@@ -259,11 +323,22 @@ final class DesktopReplayController {
               session.player.currentItem === session.item else {
             throw ReplayError.notPrepared
         }
-        guard url.isFileURL, canonicalURL(url) == session.url else {
-            throw ReplayError.preparedSourceMismatch
-        }
         try checkPreparation(session)
-        if state == .holding, !session.completedToEnd { throw ReplayError.notPrepared }
+        return session
+    }
+
+    /// The end notification is authoritative. This exact-boundary check only
+    /// reconciles its possible delivery delay while a zero-rate player is at the
+    /// valid natural endpoint; no tolerance can cut off the final video frames.
+    private func hasReachedNaturalEnd(_ session: DesktopReplaySession) -> Bool {
+        guard session.player.rate == 0 else { return false }
+        let current = session.player.currentTime()
+        let duration = session.item.duration
+        let seconds = CMTimeGetSeconds(current)
+        let durationSeconds = CMTimeGetSeconds(duration)
+        guard current.isNumeric, duration.isNumeric,
+              seconds.isFinite, durationSeconds.isFinite, durationSeconds > 0 else { return false }
+        return CMTimeCompare(current, duration) >= 0
     }
 
     /// Convenience for replaying without a native configuration change.
@@ -353,7 +428,9 @@ final class DesktopReplayController {
         session.mediaObservers.append(center.addObserver(forName: .AVPlayerItemDidPlayToEndTime,
                                                           object: session.item, queue: .main) {
             [weak self, weak session] _ in
-            Task { @MainActor [weak self, weak session] in
+            // queue: .main permits synchronous actor isolation, so an already
+            // delivered natural end cannot sit behind a subsequent resume task.
+            MainActor.assumeIsolated {
                 guard let session else { return }
                 self?.holdLastFrame(session: session)
             }
@@ -384,7 +461,8 @@ final class DesktopReplayController {
     }
 
     private func holdLastFrame(session: DesktopReplaySession) {
-        guard isCurrent(session), visibleSession === session, state == .playing else { return }
+        guard isCurrent(session), visibleSession === session,
+              state == .playing || state == .paused else { return }
         session.player.pause()
         session.completedToEnd = true
         playbackMonitor?.cancel()
